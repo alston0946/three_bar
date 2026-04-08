@@ -24,8 +24,16 @@ jobs:
       SLEEP_SEC: "0.10"
       BATCH_START: "0"
       BATCH_SIZE: "10000"
-      # 留空时，脚本会自动使用北京时间今天作为 TARGET_DATES
       TARGET_DATES: ""
+
+      # 邮件参数
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      MAIL_FROM: ${{ secrets.MAIL_FROM }}
+      MAIL_SUBJECT_PREFIX: "A股 3 Bar Play 扫描结果"
 
     steps:
       - name: Checkout repository
@@ -53,6 +61,8 @@ jobs:
           test -f data/a_share_below_8b.csv || (echo "Missing data/a_share_below_8b.csv" && exit 1)
           test -f data/st_stocks.csv || (echo "Missing data/st_stocks.csv" && exit 1)
           test -f three_bar_play_multi_dates.py || (echo "Missing three_bar_play_multi_dates.py" && exit 1)
+          test -f send_scan_email.py || (echo "Missing send_scan_email.py" && exit 1)
+          test -f requirements.txt || (echo "Missing requirements.txt" && exit 1)
 
       - name: Install dependencies
         run: |
@@ -70,6 +80,9 @@ jobs:
         run: |
           echo "Output directory:"
           ls -lah output || true
+
+      - name: Send email
+        run: python send_scan_email.py
 
       - name: Upload output artifacts
         if: always()
