@@ -76,8 +76,8 @@ CLOSE_NEAR_HIGH_MAX = 0.25
 BREAKOUT_NEAR_30D_RATIO = 0.98
 
 # 启动棒距离 target_date 的位置约束
-# 由于现在整理区定义为“target_date之前的1~3根K线”，
-# 所以 days_from_last = pullback_bars + 1，会自然落在 2~4
+# 现在整理区定义为 target_date 之前的 1~3 根K线，
+# target_date 当天单独作为触发/判断日
 IGNITE_LOOKBACK_MIN = 2
 IGNITE_LOOKBACK_MAX = 5
 
@@ -388,7 +388,7 @@ def check_ignite_bar(df: pd.DataFrame, i: int):
         "ignite_pct_chg": round(float(row["pct_chg"]) * 100, 2),
         "ignite_body_ratio": round(float(row["body_ratio"]), 4),
         "ignite_close_near_high": round(float(row["close_near_high"]), 4),
-        "ignite_range_pct": round(float(row["daily_range_pct"]) * 100, 2),
+        "ignite_range_pct": round(float(row["daily_range_pct"]) * 100, 2) if pd.notna(row["daily_range_pct"]) else np.nan,
         "ignite_vol_vs_ma5": round(safe_ratio(row["volume"], row["vol_ma5"]), 2),
         "ignite_vol_vs_ma20": round(safe_ratio(row["volume"], row["vol_ma20"]), 2),
         "ignite_close_vs_prev30high": round(safe_ratio(row["close"], row["high_30_prev"]), 4),
@@ -702,6 +702,7 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
     debug_list = []
     failed_list = []
 
+    # 1) 先取数
     try:
         raw = fetch_tushare_daily_with_retry(pro, ts_code, start_date, end_date, max_retry=3)
     except Exception as e:
@@ -714,6 +715,7 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
         })
         return matched_list, debug_list, failed_list
 
+    # 2) 再标准化
     try:
         df_full = standardize_tushare_daily(raw)
     except Exception as e:
@@ -736,6 +738,7 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
         })
         return matched_list, debug_list, failed_list
 
+    # 3) 再逐日期检查
     for target_date in target_dates:
         try:
             df = slice_df_to_target_date(df_full, target_date)
@@ -748,16 +751,6 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
                     "target_date": target_date,
                     "error": "no_data_before_target_date",
                     "reason_list": "no_data_before_target_date",
-                    **get_default_factor_flags()
-                })
-                continue
-
-            if lenreason_list": "no_data_before_target_date",
-                    **get_default_factor_flags()
-                })
-                continue
-
-            if lenreason_list": "no_data_before_target_date",
                     **get_default_factor_flags()
                 })
                 continue
