@@ -3,7 +3,7 @@ name: three-bar-play-scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 8 * * 1-5"   # 周一到周五，北京/东京 16:30
+    - cron: "30 8 * * 1-5"   # 北京时间/东京时间 16:30，周一到周五
 
 permissions:
   contents: read
@@ -22,7 +22,9 @@ jobs:
       START_DATE: "20250101"
       MAX_WORKERS: "1"
       SLEEP_SEC: "0.10"
-      # TARGET_DATES 留空时，脚本默认取北京时间今天
+      BATCH_START: "0"
+      BATCH_SIZE: "10000"
+      # 留空时，脚本会自动使用北京时间今天作为 TARGET_DATES
       TARGET_DATES: ""
 
     steps:
@@ -38,6 +40,20 @@ jobs:
       - name: Show Python version
         run: python --version
 
+      - name: Check repository files
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository files:"
+          ls -R
+
+      - name: Check required data files
+        run: |
+          test -f data/a_share_codes_for_akshare.csv || (echo "Missing data/a_share_codes_for_akshare.csv" && exit 1)
+          test -f data/a_share_below_8b.csv || (echo "Missing data/a_share_below_8b.csv" && exit 1)
+          test -f data/st_stocks.csv || (echo "Missing data/st_stocks.csv" && exit 1)
+          test -f three_bar_play_multi_dates.py || (echo "Missing three_bar_play_multi_dates.py" && exit 1)
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -48,6 +64,12 @@ jobs:
 
       - name: Run scanner
         run: python three_bar_play_multi_dates.py
+
+      - name: Show output files
+        if: always()
+        run: |
+          echo "Output directory:"
+          ls -lah output || true
 
       - name: Upload output artifacts
         if: always()
