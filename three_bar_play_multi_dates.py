@@ -3,21 +3,27 @@
 """
 ========================================================
 Tushare版：A股日线 3 Bar Play 多日期扫描脚本（GitHub Action 版）
+A/B/C 类：
+- A类：整理后接近突破
+- B类：整理后已突破
+- C类：无整理bar，次日直接续强
 ========================================================
 
 本版说明：
-1. 整理区改为：真正允许 1~3 根K线
-   - 这里的“整理区K线”定义为：启动棒之后、target_date之前的休整K线
+1. 整理区真正允许 1~3 根K线
+   - 整理区定义为：启动棒之后、target_date之前的休整K线
    - target_date 当天单独作为触发/判断日
-2. 保留 A/B 类判断
-   - A类：target_date 当天收盘接近整理区收盘高点，但未突破
-   - B类：target_date 当天收盘突破整理区收盘高点
-3. 删除“当日振幅 > 过去10日平均振幅 × 1.5”条件（沿用你当前版本）
-4. 适配 GitHub Actions：
+2. A/B 类保留
+3. 新增 C 类：
+   - 启动棒后没有整理bar
+   - 次日（target_date）直接强势续涨
+   - 定义为：target_date 当天收盘 > 启动棒最高价，并满足一定强势条件
+4. 删除“当日振幅 > 过去10日平均振幅 × 1.5”条件
+5. 适配 GitHub Actions：
    - 使用仓库相对路径 data/ 与 output/
-   - TUSHARE_TOKEN 从环境变量读取，不写死在代码里
-   - 默认 target_date 为“北京时间今天”
-   - 也支持环境变量 TARGET_DATES=20260407,20260408 这种覆盖
+   - TUSHARE_TOKEN 从环境变量读取
+   - 默认 target_date 为北京时间今天
+   - 也支持环境变量 TARGET_DATES=20260407,20260408 覆盖
 """
 
 import os
@@ -76,12 +82,10 @@ CLOSE_NEAR_HIGH_MAX = 0.25
 BREAKOUT_NEAR_30D_RATIO = 0.98
 
 # 启动棒距离 target_date 的位置约束
-# 现在整理区定义为 target_date 之前的 1~3 根K线，
-# target_date 当天单独作为触发/判断日
 IGNITE_LOOKBACK_MIN = 2
 IGNITE_LOOKBACK_MAX = 5
 
-# 整理区根数：真正改为 1~3 根
+# 整理区根数：真正允许 1~3 根
 PULLBACK_BARS_MIN = 1
 PULLBACK_BARS_MAX = 3
 
@@ -89,6 +93,12 @@ PULLBACK_BAR_RANGE_RATIO_MAX = 0.60
 BIG_BEAR_DROP_MAX = -0.03
 
 A_CLASS_NEAR_HIGH_RATIO = 0.98
+
+# =========================
+# C 类参数（无整理直接续强）
+# =========================
+C_CLASS_CLOSE_NEAR_HIGH_MAX = 0.35
+C_CLASS_MIN_VOL_RATIO_TO_IGNITE = 0.80
 
 
 # =========================
@@ -293,7 +303,7 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["vol_ma5"] = out["volume"].rolling(5).mean()
     out["vol_ma20"] = out["volume"].rolling(20).mean()
 
-    # 仍然沿用“前30日最高 high”
+    # 沿用“前30日最高 high”
     out["high_30_prev"] = out["high"].rolling(30).max().shift(1)
 
     return out
@@ -367,8 +377,14 @@ def get_default_factor_flags():
         "pullback_no_big_bear_ok": None,
         "pullback_close_above_body_mid_ok": None,
 
+        "c_break_ignite_high_ok": None,
+        "c_today_bullish_ok": None,
+        "c_today_close_near_high_ok": None,
+        "c_today_volume_ratio_ok": None,
+
         "signal_is_a_class_ok": None,
         "signal_is_b_class_ok": None,
+        "signal_is_c_class_ok": None,
     }
 
 
@@ -525,7 +541,7 @@ def get_pullback_high_close_before_today(df: pd.DataFrame, ignite_idx: int, targ
     return pullback_high_close, {}
 
 
-def classify_signal(df: pd.DataFrame, pullback_high_close: float):
+def classify_signal_ab(df: pd.DataFrame, pullback_high_close: float):
     last = df.iloc[-1]
     close_now = float(last["close"])
 
@@ -543,6 +559,7 @@ def classify_signal(df: pd.DataFrame, pullback_high_close: float):
 
     factor_flags["signal_is_a_class_ok"] = bool(a_ok)
     factor_flags["signal_is_b_class_ok"] = bool(b_ok)
+    factor_flags["signal_is_c_class_ok"] = False
 
     if a_ok:
         return True, "A_待突破", [], metrics, factor_flags
@@ -553,10 +570,87 @@ def classify_signal(df: pd.DataFrame, pullback_high_close: float):
     return False, "", ["signal_not_near_pullback_high_and_not_breakout"], metrics, factor_flags
 
 
+def check_c_class_no_pullback(df: pd.DataFrame):
+    """
+    C类：无整理bar，启动棒后次日直接续强
+    结构：
+    - ignite_idx = last_idx - 1
+    - target_date 当天直接作为续强日
+    条件：
+    1) 启动棒本身满足 ignite 条件
+    2) target_date 当天收盘 > 启动棒 high
+    3) target_date 当天为阳线
+    4) target_date 当天收盘不能太远离最高点
+    5) target_date 当天量能至少不明显缩太多（>= 启动棒量能 * 0.8）
+    """
+    factor_flags = get_default_factor_flags()
+    last_idx = len(df) - 1
+    ignite_idx = last_idx - 1
+
+    if ignite_idx < 30:
+        return False, {}
+
+    ignite_ok, ignite_reasons, ignite_metrics, ignite_flags = check_ignite_bar(df, ignite_idx)
+    factor_flags.update(ignite_flags)
+
+    if not ignite_ok:
+        return False, {}
+
+    ignite = df.iloc[ignite_idx]
+    last = df.iloc[last_idx]
+
+    if pd.isna(last["close_near_high"]) or pd.isna(last["volume"]):
+        return False, {}
+
+    break_ignite_high_ok = float(last["close"]) > float(ignite["high"])
+    today_bullish_ok = float(last["close"]) > float(last["open"])
+    today_close_near_high_ok = float(last["close_near_high"]) <= C_CLASS_CLOSE_NEAR_HIGH_MAX
+    today_volume_ratio_ok = float(last["volume"]) >= float(ignite["volume"]) * C_CLASS_MIN_VOL_RATIO_TO_IGNITE
+
+    factor_flags["c_break_ignite_high_ok"] = bool(break_ignite_high_ok)
+    factor_flags["c_today_bullish_ok"] = bool(today_bullish_ok)
+    factor_flags["c_today_close_near_high_ok"] = bool(today_close_near_high_ok)
+    factor_flags["c_today_volume_ratio_ok"] = bool(today_volume_ratio_ok)
+
+    matched = (
+        break_ignite_high_ok and
+        today_bullish_ok and
+        today_close_near_high_ok and
+        today_volume_ratio_ok
+    )
+
+    if not matched:
+        return False, {}
+
+    factor_flags["signal_is_a_class_ok"] = False
+    factor_flags["signal_is_b_class_ok"] = False
+    factor_flags["signal_is_c_class_ok"] = True
+
+    metrics = {
+        **ignite_metrics,
+        "pullback_bars": 0,
+        "signal_date": last["date"].strftime("%Y-%m-%d"),
+        "close_now": round(float(last["close"]), 2),
+        "pullback_high_close": np.nan,
+        "dist_to_pullback_high_close_pct": np.nan,
+        "c_ref_ignite_high": round(float(ignite["high"]), 2),
+        "dist_to_ignite_high_pct": round((float(last["close"]) / float(ignite["high"]) - 1.0) * 100, 2),
+        "c_today_pct_chg": round(float(last["pct_chg"]) * 100, 2) if pd.notna(last["pct_chg"]) else np.nan,
+        "c_today_volume_vs_ignite": round(safe_ratio(last["volume"], ignite["volume"]), 2),
+    }
+
+    return True, {
+        "matched": True,
+        "signal_type": "C_无整理直强",
+        **metrics,
+        **factor_flags
+    }
+
+
 # =========================
 # 总检查函数
 # =========================
-def check_3barplay_ab(df: pd.DataFrame):
+def check_3barplay_abc(df: pd.DataFrame):
     if df is None or df.empty or len(df) < 40:
         return {
             "matched": False,
@@ -588,15 +682,20 @@ def check_3barplay_ab(df: pd.DataFrame):
             **last_flags
         }
 
+    # 先检查 C 类（无整理直接续强）
+    c_ok, c_result = check_c_class_no_pullback(df)
+    if c_ok:
+        return c_result
+
     candidate_debugs = []
 
+    # 再检查 A/B 类（1~3 根整理）
     for pullback_bars in range(PULLBACK_BARS_MIN, PULLBACK_BARS_MAX + 1):
         factor_flags = get_default_factor_flags()
         factor_flags.update(last_flags)
+        factor_flags["signal_is_c_class_ok"] = False
 
-        # 关键修正：
-        # pullback_bars 只统计 target_date 之前的整理K线，
-        # target_date 当天单独作为触发/判断日
+        # pullback_bars 只统计 target_date 之前的整理K线
         ignite_idx = last_idx - pullback_bars - 1
         days_from_last = last_idx - ignite_idx
 
@@ -652,7 +751,7 @@ def check_3barplay_ab(df: pd.DataFrame):
             })
             continue
 
-        signal_ok, signal_type, signal_reasons, signal_metrics, signal_flags = classify_signal(
+        signal_ok, signal_type, signal_reasons, signal_metrics, signal_flags = classify_signal_ab(
             df, pullback_high_close
         )
         factor_flags.update(signal_flags)
@@ -688,8 +787,8 @@ def check_3barplay_ab(df: pd.DataFrame):
 
     return {
         "matched": False,
-        "reason": "no_valid_3barplay_ab",
-        "reason_list": "no_valid_3barplay_ab",
+        "reason": "no_valid_3barplay_abc",
+        "reason_list": "no_valid_3barplay_abc",
         **get_default_factor_flags()
     }
 
@@ -702,7 +801,6 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
     debug_list = []
     failed_list = []
 
-    # 1) 先取数
     try:
         raw = fetch_tushare_daily_with_retry(pro, ts_code, start_date, end_date, max_retry=3)
     except Exception as e:
@@ -715,7 +813,6 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
         })
         return matched_list, debug_list, failed_list
 
-    # 2) 再标准化
     try:
         df_full = standardize_tushare_daily(raw)
     except Exception as e:
@@ -738,7 +835,6 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
         })
         return matched_list, debug_list, failed_list
 
-    # 3) 再逐日期检查
     for target_date in target_dates:
         try:
             df = slice_df_to_target_date(df_full, target_date)
@@ -767,7 +863,7 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
                 })
                 continue
 
-            chk = check_3barplay_ab(df)
+            chk = check_3barplay_abc(df)
 
             if chk.get("matched", False):
                 matched_list.append({
@@ -807,10 +903,10 @@ def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, ta
 # =========================
 def make_output_paths(end_date: str):
     return {
-        "output": os.path.join(OUTPUT_DIR, f"three_bar_play_ab_candidates_{end_date}.csv"),
-        "debug": os.path.join(OUTPUT_DIR, f"three_bar_play_ab_debug_rejected_{end_date}.csv"),
-        "failed": os.path.join(OUTPUT_DIR, f"three_bar_play_ab_failed_fetch_{end_date}.csv"),
-        "filtered": os.path.join(OUTPUT_DIR, f"three_bar_play_ab_filtered_out_{end_date}.csv"),
+        "output": os.path.join(OUTPUT_DIR, f"three_bar_play_abc_candidates_{end_date}.csv"),
+        "debug": os.path.join(OUTPUT_DIR, f"three_bar_play_abc_debug_rejected_{end_date}.csv"),
+        "failed": os.path.join(OUTPUT_DIR, f"three_bar_play_abc_failed_fetch_{end_date}.csv"),
+        "filtered": os.path.join(OUTPUT_DIR, f"three_bar_play_abc_filtered_out_{end_date}.csv"),
     }
 
 
@@ -845,7 +941,7 @@ def main():
             row = sub.iloc[0]
             print(f"检查 {test_code} | name={row['name']} | ts_code={row['ts_code']} | 已成功过滤")
 
-    print("\n2) 开始 3 Bar Play 多日期扫描（Tushare）...")
+    print("\n2) 开始 3 Bar Play A/B/C 多日期扫描（Tushare）...")
 
     matched = []
     debug_rejected = []
@@ -927,7 +1023,7 @@ def main():
     print("过滤掉数量(ST/80亿以下):", len(filtered_df))
 
     if not matched_df.empty and "signal_type" in matched_df.columns:
-        print("\nA/B 类数量统计：")
+        print("\nA/B/C 类数量统计：")
         print(matched_df["signal_type"].value_counts())
 
     if not matched_df.empty and "target_date" in matched_df.columns:
@@ -943,7 +1039,8 @@ def main():
         cols = [
             "ticker", "name", "ts_code", "target_date", "signal_type", "signal_date",
             "ignite_date", "pullback_bars", "ignite_pct_chg", "ignite_vol_vs_ma5",
-            "ignite_vol_vs_ma20", "pullback_high_close", "close_now", "dist_to_pullback_high_close_pct"
+            "ignite_vol_vs_ma20", "pullback_high_close", "close_now",
+            "dist_to_pullback_high_close_pct", "dist_to_ignite_high_pct"
         ]
         cols = [c for c in cols if c in matched_df.columns]
         print(matched_df[cols].head(20).to_string(index=False))
@@ -960,7 +1057,9 @@ def main():
             "pullback_bars_1_to_3_ok", "pullback_low_above_body_mid_ok",
             "pullback_bar_range_small_ok", "pullback_avg_volume_lower_ok",
             "pullback_no_big_bear_ok", "pullback_close_above_body_mid_ok",
-            "signal_is_a_class_ok", "signal_is_b_class_ok"
+            "c_break_ignite_high_ok", "c_today_bullish_ok",
+            "c_today_close_near_high_ok", "c_today_volume_ratio_ok",
+            "signal_is_a_class_ok", "signal_is_b_class_ok", "signal_is_c_class_ok"
         ]
         cols = [c for c in cols if c in debug_df.columns]
         print(debug_df[cols].head(20).to_string(index=False))
