@@ -3,8 +3,7 @@ name: three-bar-play-scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 8 * * 1-5"   # 北京时间/东京时间 16:30，周一到周五
-
+    - cron: "0 9 * * 1-5"   # 北京时间/东京时间 16:30，周一到周五
 permissions:
   contents: read
 
