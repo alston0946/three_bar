@@ -1,0 +1,1283 @@
+# -*- coding: utf-8 -*-
+
+"""
+========================================================
+Tushare版：A股日线 3 Bar Play 多日期扫描脚本
+（A类 + C类；支持 A0/A1~A3；因子级调试信息）
+========================================================
+
+【本版逻辑】
+1. 只输出：
+   - A类：待突破
+   - C类：当日启动棒
+   不再输出 B类（已突破）
+
+2. A类分成两种：
+   - A0_首日整理：
+       昨天是启动棒，今天是目标日；
+       今天若满足“单根整理K线”的条件，则归为A类
+   - A1_A3_待突破：
+       更早之前有启动棒；
+       启动棒之后、目标日之前有 1~3 根整理K线；
+       目标日当天接近整理区收盘高点，但未突破
+
+3. C类定义：
+   - 不要求此前已经出现启动棒
+   - 只要目标日当天本身满足启动棒条件，就直接归为 C类
+
+4. 关键调整：
+   - close_near_high 条件放宽为：< 0.35
+   - 标准整理区支持 1~3 根
+   - 标准 A1~A3 中，目标日当天不再纳入整理区
+   - A类近高点阈值放宽为 0.96
+
+5. 新增备注说明（不参与筛选）：
+   - 对 A0、A1、A2、A3 命中案例，额外备注其是否更符合
+     “inside / equal highs 优先”
+   - 输出字段：
+       inside_equal_highs_priority_ok
+       inside_equal_highs_note
+
+6. 股票池过滤：
+   - 剔除 ST
+   - 剔除 80亿以下股票
+"""
+
+import os
+import time
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+import tushare as ts
+
+
+# =========================
+# 清理代理
+# =========================
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+
+
+# =========================
+# 仓库路径
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CODE_FILE = os.path.join(DATA_DIR, "a_share_codes_for_akshare.csv")
+BELOW_8B_FILE = os.path.join(DATA_DIR, "a_share_below_8b.csv")
+ST_FILE = os.path.join(DATA_DIR, "st_stocks.csv")
+
+
+# =========================
+# 环境变量 / 运行参数
+# =========================
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "").strip()
+
+START_DATE = os.getenv("START_DATE", "20250101").strip()
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
+TEST_LIMIT = None if not os.getenv("TEST_LIMIT") else int(os.getenv("TEST_LIMIT"))
+BATCH_START = int(os.getenv("BATCH_START", "0"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10000"))
+SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.10"))
+
+
+# =========================
+# 3 Bar Play 参数
+# =========================
+MA_PERIOD = 20
+
+IGNITE_MIN_PCT = 0.04
+BODY_RATIO_MIN = 0.60
+CLOSE_NEAR_HIGH_MAX = 0.35
+BREAKOUT_NEAR_30D_RATIO = 0.98
+
+IGNITE_LOOKBACK_MIN = 2
+IGNITE_LOOKBACK_MAX = 5
+
+# 标准整理区只针对 A1~A3；A0 单独处理
+PULLBACK_BARS_MIN = 1
+PULLBACK_BARS_MAX = 3
+PULLBACK_BAR_RANGE_RATIO_MAX = 0.60
+BIG_BEAR_DROP_MAX = -0.03
+
+# A类“接近整理区高点”阈值
+A_CLASS_NEAR_HIGH_RATIO = 0.96
+
+# inside / equal highs 备注参数（只做说明，不参与筛选）
+EQUAL_HIGH_TOL_RATIO = 0.10   # 等高容差：启动棒振幅的10%
+
+
+# =========================
+# 日期处理
+# =========================
+def get_today_cn_str() -> str:
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y%m%d")
+
+
+def get_target_dates():
+    """
+    优先读取环境变量 TARGET_DATES，例如：
+    TARGET_DATES=20260407,20260408
+    否则默认使用北京时间今天。
+    """
+    raw = os.getenv("TARGET_DATES", "").strip()
+    if raw:
+        items = []
+        for part in raw.replace(";", ",").replace("\n", ",").split(","):
+            s = part.strip()
+            if s:
+                items.append(s)
+    else:
+        items = [get_today_cn_str()]
+
+    target_dates = sorted({x for x in items if x.isdigit() and len(x) == 8})
+    if not target_dates:
+        raise ValueError("TARGET_DATES 为空，且未能生成默认日期。")
+    return target_dates
+
+
+# =========================
+# 工具函数
+# =========================
+def read_csv_safely(path: str) -> pd.DataFrame:
+    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc, dtype=str)
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+def safe_ratio(a, b, default=np.nan):
+    try:
+        a = float(a)
+        b = float(b)
+        if pd.isna(a) or pd.isna(b) or b == 0:
+            return default
+        return a / b
+    except Exception:
+        return default
+
+
+def normalize_to_6digits(x: str) -> str:
+    s = str(x).strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) == 6:
+        return digits
+    if len(digits) > 6:
+        return digits[-6:]
+    if len(digits) > 0:
+        return digits.zfill(6)
+    return ""
+
+
+def code6_to_ts_code(code6: str) -> str:
+    if code6.startswith(("600", "601", "603", "605", "688", "900")):
+        return f"{code6}.SH"
+    return f"{code6}.SZ"
+
+
+def to_target_dt(target_date: str):
+    return pd.to_datetime(target_date, format="%Y%m%d")
+
+
+def bool_or_none(x):
+    if x is None:
+        return None
+    return bool(x)
+
+
+def build_signal_metrics(signal_date, close_now, ref_close=np.nan):
+    if pd.isna(ref_close):
+        dist_pct = np.nan
+        ref_close_val = np.nan
+    else:
+        ref_close_val = round(float(ref_close), 2)
+        dist_pct = round((float(close_now) / float(ref_close) - 1.0) * 100, 2)
+
+    return {
+        "signal_date": signal_date.strftime("%Y-%m-%d"),
+        "close_now": round(float(close_now), 2),
+        "pullback_high_close": ref_close_val,
+        "dist_to_pullback_high_close_pct": dist_pct,
+    }
+
+
+def get_default_inside_equal_highs_fields():
+    return {
+        "inside_equal_highs_priority_ok": None,
+        "inside_equal_highs_note": "",
+    }
+
+
+def evaluate_inside_equal_highs_a0(df: pd.DataFrame, ignite_idx: int, last_idx: int):
+    """
+    A0：昨天是启动棒，今天是首日整理
+    这里只做备注，不作为筛选条件
+    """
+    ignite = df.iloc[ignite_idx]
+    today = df.iloc[last_idx]
+
+    ignite_range_abs = max(float(ignite["bar_range_abs"]), 1e-8)
+    tol = max(ignite_range_abs * EQUAL_HIGH_TOL_RATIO, 0.01)
+
+    inside_bar_ok = (today["high"] <= ignite["high"] + tol) and (today["low"] >= ignite["low"] - tol)
+    equal_highs_ok = abs(float(today["high"]) - float(ignite["high"])) <= tol
+
+    if inside_bar_ok and equal_highs_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "inside_bar + equal_highs"
+        }
+    elif inside_bar_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "inside_bar"
+        }
+    elif equal_highs_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "equal_highs"
+        }
+    else:
+        return {
+            "inside_equal_highs_priority_ok": False,
+            "inside_equal_highs_note": ""
+        }
+
+
+def evaluate_inside_equal_highs_pullback(df: pd.DataFrame, ignite_idx: int, last_idx: int):
+    """
+    A1~A3：启动棒之后、目标日前一天的整理区
+    只做备注，不参与筛选
+
+    备注逻辑：
+    1. inside_bar 优先：整理区每根bar都尽量是前一根bar的 inside bar
+    2. equal_highs 优先：整理区高点彼此很接近
+    """
+    pb = df.iloc[ignite_idx + 1:last_idx].copy()
+    ignite = df.iloc[ignite_idx]
+
+    if pb.empty:
+        return {
+            "inside_equal_highs_priority_ok": False,
+            "inside_equal_highs_note": ""
+        }
+
+    ignite_range_abs = max(float(ignite["bar_range_abs"]), 1e-8)
+    tol = max(ignite_range_abs * EQUAL_HIGH_TOL_RATIO, 0.01)
+
+    # 1) 是否是连续 inside bars
+    prev_high = float(ignite["high"])
+    prev_low = float(ignite["low"])
+    nested_inside_ok = True
+
+    for _, row in pb.iterrows():
+        cur_high = float(row["high"])
+        cur_low = float(row["low"])
+
+        if not (cur_high <= prev_high + tol and cur_low >= prev_low - tol):
+            nested_inside_ok = False
+            break
+
+        prev_high = cur_high
+        prev_low = cur_low
+
+    # 2) 是否是 equal highs
+    equal_highs_ok = (float(pb["high"].max()) - float(pb["high"].min())) <= tol
+
+    if nested_inside_ok and equal_highs_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "inside_bar + equal_highs"
+        }
+    elif nested_inside_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "inside_bar"
+        }
+    elif equal_highs_ok:
+        return {
+            "inside_equal_highs_priority_ok": True,
+            "inside_equal_highs_note": "equal_highs"
+        }
+    else:
+        return {
+            "inside_equal_highs_priority_ok": False,
+            "inside_equal_highs_note": ""
+        }
+
+
+# =========================
+# 股票池过滤
+# =========================
+def load_st_codes() -> set:
+    df = read_csv_safely(ST_FILE)
+    if "ticker" not in df.columns:
+        raise ValueError(f"ST 文件里没有 ticker 列，实际列名: {list(df.columns)}")
+    return set(df["ticker"].astype(str).str.strip().str.zfill(6).dropna().tolist())
+
+
+def load_below_8b_codes() -> set:
+    df = read_csv_safely(BELOW_8B_FILE)
+    if "ticker" not in df.columns:
+        raise ValueError(f"80亿以下文件里没有 ticker 列，实际列名: {list(df.columns)}")
+    return set(df["ticker"].astype(str).str.strip().str.zfill(6).dropna().tolist())
+
+
+def load_universe_from_csv():
+    df = read_csv_safely(CODE_FILE)
+
+    required_cols = ["ticker", "secShortName"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise ValueError(f"代码文件缺少列: {c}")
+
+    out = df.copy()
+    out["ticker"] = out["ticker"].astype(str).map(normalize_to_6digits)
+    out["name"] = out["secShortName"].astype(str).str.strip()
+    out = out[out["ticker"].str.len() == 6].copy()
+
+    st_codes = load_st_codes()
+    below_8b_codes = load_below_8b_codes()
+
+    out["is_st"] = out["ticker"].isin(st_codes)
+    out["is_below_8b"] = out["ticker"].isin(below_8b_codes)
+
+    filtered_out = out[(out["is_st"]) | (out["is_below_8b"])].copy()
+    universe = out[(~out["is_st"]) & (~out["is_below_8b"])].copy()
+
+    out["ts_code"] = out["ticker"].map(code6_to_ts_code)
+    universe["ts_code"] = universe["ticker"].map(code6_to_ts_code)
+    filtered_out["ts_code"] = filtered_out["ticker"].map(code6_to_ts_code)
+
+    universe = universe.drop_duplicates("ticker").reset_index(drop=True)
+    filtered_out = filtered_out.drop_duplicates("ticker").reset_index(drop=True)
+
+    if TEST_LIMIT is not None:
+        universe = universe.head(TEST_LIMIT).copy()
+    else:
+        universe = universe.iloc[BATCH_START:BATCH_START + BATCH_SIZE].copy()
+
+    return universe[["ticker", "ts_code", "name"]].reset_index(drop=True), filtered_out
+
+
+# =========================
+# Tushare 取数
+# =========================
+def fetch_tushare_daily_with_retry(pro, ts_code: str, start_date: str, end_date: str, max_retry: int = 3):
+    last_err = None
+    for attempt in range(max_retry):
+        try:
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if df is not None and not df.empty:
+                return df
+            last_err = "empty dataframe"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        time.sleep(0.8 + attempt * 0.8)
+    raise RuntimeError(str(last_err))
+
+
+def standardize_tushare_daily(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    required_cols = ["trade_date", "open", "high", "low", "close", "vol"]
+    missing = [c for c in required_cols if c not in out.columns]
+    if missing:
+        raise ValueError(f"Tushare daily 缺少字段: {missing}")
+
+    out["date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d", errors="coerce")
+    out["open"] = pd.to_numeric(out["open"], errors="coerce")
+    out["high"] = pd.to_numeric(out["high"], errors="coerce")
+    out["low"] = pd.to_numeric(out["low"], errors="coerce")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out["volume"] = pd.to_numeric(out["vol"], errors="coerce")
+    out["amount"] = pd.to_numeric(out["amount"], errors="coerce") if "amount" in out.columns else np.nan
+    out["pct_chg"] = pd.to_numeric(out["pct_chg"], errors="coerce") / 100.0 if "pct_chg" in out.columns else np.nan
+
+    out = out.dropna(subset=["date", "open", "high", "low", "close", "volume"]).copy()
+    out = out.sort_values("date").reset_index(drop=True)
+    return out[["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]]
+
+
+# =========================
+# 指标构建
+# =========================
+def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    if "pct_chg" not in out.columns or out["pct_chg"].isna().all():
+        out["pct_chg"] = out["close"].pct_change()
+
+    out["daily_range_pct"] = (out["high"] - out["low"]) / out["close"].shift(1)
+    out["bar_range_abs"] = (out["high"] - out["low"]).clip(lower=1e-8)
+
+    out["body"] = (out["close"] - out["open"]).abs()
+    out["body_ratio"] = out["body"] / out["bar_range_abs"]
+    out["close_near_high"] = (out["high"] - out["close"]) / out["bar_range_abs"]
+
+    out["ma20"] = out["close"].rolling(MA_PERIOD).mean()
+    out["ma20_prev"] = out["ma20"].shift(1)
+
+    out["vol_ma5"] = out["volume"].rolling(5).mean()
+    out["vol_ma20"] = out["volume"].rolling(20).mean()
+
+    out["high_30_prev"] = out["high"].rolling(30).max().shift(1)
+
+    return out
+
+
+# =========================
+# 数据切片
+# =========================
+def slice_df_to_target_date(df: pd.DataFrame, target_date: str) -> pd.DataFrame:
+    target_dt = to_target_dt(target_date)
+    sub = df[df["date"] <= target_dt].copy()
+    sub = sub.sort_values("date").reset_index(drop=True)
+    return sub
+
+
+# =========================
+# 因子级检查
+# =========================
+def get_default_factor_flags():
+    return {
+        "last_day_close_above_ma20_ok": None,
+        "last_day_ma20_not_down_ok": None,
+
+        "ignite_window_match_ok": None,
+        "ignite_pct_ge_4pct_ok": None,
+        "ignite_body_ratio_ge_0p6_ok": None,
+        "ignite_close_near_high_ok": None,
+        "ignite_volume_above_ma5_ok": None,
+        "ignite_volume_above_ma20_ok": None,
+        "ignite_near_prev30_high_ok": None,
+
+        "pullback_bars_1_to_3_ok": None,
+        "pullback_low_above_body_mid_ok": None,
+        "pullback_bar_range_small_ok": None,
+        "pullback_avg_volume_lower_ok": None,
+        "pullback_no_big_bear_ok": None,
+        "pullback_close_above_body_mid_ok": None,
+
+        "a0_yesterday_ignite_ok": None,
+        "a0_today_pullback_ok": None,
+
+        "signal_is_a_class_ok": None,
+        "signal_is_c_class_ok": None,
+    }
+
+
+def check_last_day_trend(df: pd.DataFrame):
+    last = df.iloc[-1]
+
+    factor_flags = {
+        "last_day_close_above_ma20_ok": None,
+        "last_day_ma20_not_down_ok": None,
+    }
+    reasons = []
+
+    if pd.isna(last["ma20"]) or pd.isna(last["ma20_prev"]):
+        reasons.append("last_day_ma_missing")
+        return False, reasons, factor_flags
+
+    close_above = last["close"] > last["ma20"]
+    ma20_not_down = last["ma20"] >= last["ma20_prev"]
+
+    factor_flags["last_day_close_above_ma20_ok"] = bool(close_above)
+    factor_flags["last_day_ma20_not_down_ok"] = bool(ma20_not_down)
+
+    if not close_above:
+        reasons.append("last_day_close_below_ma20")
+    if not ma20_not_down:
+        reasons.append("last_day_ma20_down")
+
+    return len(reasons) == 0, reasons, factor_flags
+
+
+def check_volume_available(df: pd.DataFrame):
+    if "volume" not in df.columns:
+        return False, "volume_column_missing"
+    if df["volume"].notna().sum() < 20:
+        return False, "volume_missing"
+    return True, "ok"
+
+
+def check_ignite_bar(df: pd.DataFrame, i: int):
+    row = df.iloc[i]
+    reasons = []
+    factor_flags = get_default_factor_flags()
+
+    need_cols = ["ma20", "ma20_prev", "vol_ma5", "vol_ma20", "high_30_prev", "volume"]
+    for c in need_cols:
+        if pd.isna(row[c]):
+            reasons.append("ignite_ref_data_missing")
+            return False, reasons, {}, factor_flags
+
+    metrics = {
+        "ignite_date": row["date"].strftime("%Y-%m-%d"),
+        "ignite_pct_chg": round(float(row["pct_chg"]) * 100, 2),
+        "ignite_body_ratio": round(float(row["body_ratio"]), 4),
+        "ignite_close_near_high": round(float(row["close_near_high"]), 4),
+        "ignite_range_pct": round(float(row["daily_range_pct"]) * 100, 2) if not pd.isna(row["daily_range_pct"]) else np.nan,
+        "ignite_vol_vs_ma5": round(safe_ratio(row["volume"], row["vol_ma5"]), 2),
+        "ignite_vol_vs_ma20": round(safe_ratio(row["volume"], row["vol_ma20"]), 2),
+        "ignite_close_vs_prev30high": round(safe_ratio(row["close"], row["high_30_prev"]), 4),
+        "ignite_open": round(float(row["open"]), 2),
+        "ignite_close": round(float(row["close"]), 2),
+        "ignite_high": round(float(row["high"]), 2),
+        "ignite_low": round(float(row["low"]), 2),
+        "ignite_volume": round(float(row["volume"]), 0),
+    }
+
+    pct_ok = row["pct_chg"] >= IGNITE_MIN_PCT
+    body_ok = row["body_ratio"] >= BODY_RATIO_MIN
+    close_near_high_ok = row["close_near_high"] < CLOSE_NEAR_HIGH_MAX
+    vol_ma5_ok = row["volume"] > row["vol_ma5"]
+    vol_ma20_ok = row["volume"] > row["vol_ma20"]
+    near_prev30_ok = row["close"] >= row["high_30_prev"] * BREAKOUT_NEAR_30D_RATIO
+
+    factor_flags["ignite_pct_ge_4pct_ok"] = bool(pct_ok)
+    factor_flags["ignite_body_ratio_ge_0p6_ok"] = bool(body_ok)
+    factor_flags["ignite_close_near_high_ok"] = bool(close_near_high_ok)
+    factor_flags["ignite_volume_above_ma5_ok"] = bool(vol_ma5_ok)
+    factor_flags["ignite_volume_above_ma20_ok"] = bool(vol_ma20_ok)
+    factor_flags["ignite_near_prev30_high_ok"] = bool(near_prev30_ok)
+
+    if row["close"] <= row["ma20"]:
+        reasons.append("ignite_close_below_ma20")
+    if row["ma20"] < row["ma20_prev"]:
+        reasons.append("ignite_ma20_down")
+    if not pct_ok:
+        reasons.append("ignite_pct_lt_4pct")
+    if not body_ok:
+        reasons.append("ignite_body_ratio_fail")
+    if not close_near_high_ok:
+        reasons.append("ignite_close_not_near_high")
+    if not vol_ma5_ok:
+        reasons.append("ignite_volume_not_above_ma5")
+    if not vol_ma20_ok:
+        reasons.append("ignite_volume_not_above_ma20")
+    if not near_prev30_ok:
+        reasons.append("ignite_not_near_prev30_high")
+
+    return len(reasons) == 0, reasons, metrics, factor_flags
+
+
+def check_pullback_before_today(df: pd.DataFrame, ignite_idx: int, last_idx: int):
+    """
+    A1~A3 标准整理区：
+    只检查启动棒之后 ~ target_date 前一天
+    target_date 当天不纳入整理区
+    """
+    ignite = df.iloc[ignite_idx]
+    pb = df.iloc[ignite_idx + 1:last_idx].copy()
+
+    reasons = []
+    metrics = {}
+    factor_flags = get_default_factor_flags()
+
+    pullback_bars = len(pb)
+    bars_ok = PULLBACK_BARS_MIN <= pullback_bars <= PULLBACK_BARS_MAX
+    factor_flags["pullback_bars_1_to_3_ok"] = bool_or_none(bars_ok)
+
+    if not bars_ok:
+        reasons.append("pullback_bars_not_1_to_3")
+        return False, reasons, metrics, factor_flags
+
+    if ignite["close"] <= ignite["open"]:
+        reasons.append("ignite_not_bullish")
+        return False, reasons, metrics, factor_flags
+
+    if pb["volume"].isna().any():
+        reasons.append("pullback_volume_missing")
+        return False, reasons, metrics, factor_flags
+
+    ignite_body_mid = (ignite["open"] + ignite["close"]) / 2.0
+    ignite_range_abs = ignite["bar_range_abs"]
+    if ignite_range_abs <= 0:
+        reasons.append("ignite_range_invalid")
+        return False, reasons, metrics, factor_flags
+
+    pb_range_abs = pb["bar_range_abs"]
+    pb_pct = pb["close"].pct_change().fillna((pb.iloc[0]["close"] / ignite["close"]) - 1.0)
+
+    pullback_low = pb["low"].min()
+
+    low_above_mid_ok = pullback_low >= ignite_body_mid
+    bar_range_small_ok = (pb_range_abs < ignite_range_abs * PULLBACK_BAR_RANGE_RATIO_MAX).all()
+    avg_volume_lower_ok = pb["volume"].mean() < ignite["volume"]
+    no_big_bear_ok = (pb_pct > BIG_BEAR_DROP_MAX).all()
+    close_above_mid_ok = (pb["close"] >= ignite_body_mid).all()
+
+    factor_flags["pullback_low_above_body_mid_ok"] = bool(low_above_mid_ok)
+    factor_flags["pullback_bar_range_small_ok"] = bool(bar_range_small_ok)
+    factor_flags["pullback_avg_volume_lower_ok"] = bool(avg_volume_lower_ok)
+    factor_flags["pullback_no_big_bear_ok"] = bool(no_big_bear_ok)
+    factor_flags["pullback_close_above_body_mid_ok"] = bool(close_above_mid_ok)
+
+    metrics = {
+        "pullback_bars": pullback_bars,
+        "pullback_start_date": pb.iloc[0]["date"].strftime("%Y-%m-%d"),
+        "pullback_end_date": pb.iloc[-1]["date"].strftime("%Y-%m-%d"),
+        "pullback_low": round(float(pullback_low), 2),
+        "ignite_body_mid": round(float(ignite_body_mid), 2),
+        "pullback_avg_volume": round(float(pb["volume"].mean()), 0),
+        "pullback_max_bar_range_ratio": round(float((pb_range_abs / ignite_range_abs).max()), 4),
+    }
+
+    if not low_above_mid_ok:
+        reasons.append("pullback_low_below_ignite_body_mid")
+    if not bar_range_small_ok:
+        reasons.append("pullback_bar_range_too_large")
+    if not avg_volume_lower_ok:
+        reasons.append("pullback_avg_volume_not_lower")
+    if not no_big_bear_ok:
+        reasons.append("pullback_big_bear_bar")
+    if not close_above_mid_ok:
+        reasons.append("pullback_close_below_ignite_body_mid")
+
+    return len(reasons) == 0, reasons, metrics, factor_flags
+
+
+def check_today_as_single_pullback_bar(df: pd.DataFrame, ignite_idx: int, last_idx: int):
+    """
+    A0 特例：
+    昨天是启动棒，今天是目标日；
+    今天若满足“单根整理K线”的要求，则归为A类
+    """
+    ignite = df.iloc[ignite_idx]
+    today = df.iloc[last_idx]
+
+    reasons = []
+    metrics = {}
+    factor_flags = get_default_factor_flags()
+
+    if last_idx != ignite_idx + 1:
+        reasons.append("a0_not_adjacent")
+        return False, reasons, metrics, factor_flags
+
+    if pd.isna(today["volume"]):
+        reasons.append("a0_today_volume_missing")
+        return False, reasons, metrics, factor_flags
+
+    ignite_body_mid = (ignite["open"] + ignite["close"]) / 2.0
+    ignite_range_abs = ignite["bar_range_abs"]
+    if ignite_range_abs <= 0:
+        reasons.append("ignite_range_invalid")
+        return False, reasons, metrics, factor_flags
+
+    today_range_abs = today["bar_range_abs"]
+    today_pct = (today["close"] / ignite["close"]) - 1.0
+
+    low_above_mid_ok = today["low"] >= ignite_body_mid
+    bar_range_small_ok = today_range_abs < ignite_range_abs * PULLBACK_BAR_RANGE_RATIO_MAX
+    volume_lower_ok = today["volume"] < ignite["volume"]
+    no_big_bear_ok = today_pct > BIG_BEAR_DROP_MAX
+    close_above_mid_ok = today["close"] >= ignite_body_mid
+
+    factor_flags["pullback_bars_1_to_3_ok"] = None
+    factor_flags["pullback_low_above_body_mid_ok"] = bool(low_above_mid_ok)
+    factor_flags["pullback_bar_range_small_ok"] = bool(bar_range_small_ok)
+    factor_flags["pullback_avg_volume_lower_ok"] = bool(volume_lower_ok)
+    factor_flags["pullback_no_big_bear_ok"] = bool(no_big_bear_ok)
+    factor_flags["pullback_close_above_body_mid_ok"] = bool(close_above_mid_ok)
+    factor_flags["a0_today_pullback_ok"] = bool(
+        low_above_mid_ok and bar_range_small_ok and volume_lower_ok and no_big_bear_ok and close_above_mid_ok
+    )
+
+    metrics = {
+        "pullback_bars": 0,
+        "pullback_start_date": today["date"].strftime("%Y-%m-%d"),
+        "pullback_end_date": today["date"].strftime("%Y-%m-%d"),
+        "pullback_low": round(float(today["low"]), 2),
+        "ignite_body_mid": round(float(ignite_body_mid), 2),
+        "pullback_avg_volume": round(float(today["volume"]), 0),
+        "pullback_max_bar_range_ratio": round(float(today_range_abs / ignite_range_abs), 4),
+    }
+
+    if not low_above_mid_ok:
+        reasons.append("a0_today_low_below_ignite_body_mid")
+    if not bar_range_small_ok:
+        reasons.append("a0_today_bar_range_too_large")
+    if not volume_lower_ok:
+        reasons.append("a0_today_volume_not_lower")
+    if not no_big_bear_ok:
+        reasons.append("a0_today_big_bear_bar")
+    if not close_above_mid_ok:
+        reasons.append("a0_today_close_below_ignite_body_mid")
+
+    return len(reasons) == 0, reasons, metrics, factor_flags
+
+
+def get_pullback_high_close_before_today(df: pd.DataFrame, ignite_idx: int, last_idx: int):
+    """
+    A1~A3 的比较基准：
+    只取 target_date 前一天为止的整理区收盘高点
+    """
+    pb_before_today = df.iloc[ignite_idx + 1:last_idx].copy()
+
+    if pb_before_today.empty:
+        return None, {
+            "pullback_high_close": np.nan,
+            "dist_to_pullback_high_close_pct": np.nan
+        }
+
+    pullback_high_close = float(pb_before_today["close"].max())
+    return pullback_high_close, {}
+
+
+def classify_signal_a_only(df: pd.DataFrame, pullback_high_close: float):
+    last = df.iloc[-1]
+    close_now = float(last["close"])
+
+    metrics = build_signal_metrics(last["date"], close_now, pullback_high_close)
+    factor_flags = get_default_factor_flags()
+
+    a_ok = (close_now >= pullback_high_close * A_CLASS_NEAR_HIGH_RATIO) and (close_now <= pullback_high_close)
+    factor_flags["signal_is_a_class_ok"] = bool(a_ok)
+
+    if a_ok:
+        return True, "A_待突破", [], metrics, factor_flags
+
+    return False, "", ["signal_not_near_pullback_high"], metrics, factor_flags
+
+
+# =========================
+# 总检查函数
+# =========================
+def check_3barplay_ac(df: pd.DataFrame):
+    if df is None or df.empty or len(df) < 40:
+        return {
+            "matched": False,
+            "reason": "bars_not_enough",
+            "reason_list": "bars_not_enough",
+            **get_default_factor_flags(),
+            **get_default_inside_equal_highs_fields(),
+        }
+
+    vol_ok, vol_reason = check_volume_available(df)
+    if not vol_ok:
+        return {
+            "matched": False,
+            "reason": vol_reason,
+            "reason_list": vol_reason,
+            **get_default_factor_flags(),
+            **get_default_inside_equal_highs_fields(),
+        }
+
+    df = build_indicators(df)
+    last_idx = len(df) - 1
+
+    last_ok, last_reasons, last_flags = check_last_day_trend(df)
+    if not last_ok:
+        return {
+            "matched": False,
+            "reason": "last_day_trend_fail",
+            "reason_list": "|".join(last_reasons),
+            "close_now": round(float(df.iloc[-1]["close"]), 2),
+            **get_default_factor_flags(),
+            **get_default_inside_equal_highs_fields(),
+            **last_flags
+        }
+
+    # -------------------------------------------------
+    # 1) 先判 C 类：今天本身就是启动棒
+    #    不要求此前已经出现启动棒或整理区
+    # -------------------------------------------------
+    c_ok, c_reasons, c_metrics, c_flags = check_ignite_bar(df, last_idx)
+    if c_ok:
+        factor_flags = get_default_factor_flags()
+        factor_flags.update(last_flags)
+        factor_flags.update(c_flags)
+        factor_flags["signal_is_c_class_ok"] = True
+
+        return {
+            "matched": True,
+            "signal_type": "C_当日启动",
+            "setup_type": "C0_当日启动",
+            "pullback_bars": np.nan,
+            **build_signal_metrics(df.iloc[-1]["date"], df.iloc[-1]["close"], np.nan),
+            **get_default_inside_equal_highs_fields(),
+            **c_metrics,
+            **factor_flags
+        }
+
+    candidate_debugs = []
+
+    # -------------------------------------------------
+    # 2) 判 A0：昨天是启动棒，今天是首日整理
+    # -------------------------------------------------
+    if last_idx >= 1:
+        factor_flags = get_default_factor_flags()
+        factor_flags.update(last_flags)
+
+        a0_ignite_idx = last_idx - 1
+        a0_ignite_ok, a0_ignite_reasons, a0_ignite_metrics, a0_ignite_flags = check_ignite_bar(df, a0_ignite_idx)
+        factor_flags.update(a0_ignite_flags)
+        factor_flags["a0_yesterday_ignite_ok"] = bool(a0_ignite_ok)
+
+        if a0_ignite_ok:
+            a0_pb_ok, a0_pb_reasons, a0_pb_metrics, a0_pb_flags = check_today_as_single_pullback_bar(
+                df, a0_ignite_idx, last_idx
+            )
+            factor_flags.update(a0_pb_flags)
+
+            if a0_pb_ok:
+                factor_flags["signal_is_a_class_ok"] = True
+                inside_equal_note = evaluate_inside_equal_highs_a0(df, a0_ignite_idx, last_idx)
+
+                return {
+                    "matched": True,
+                    "signal_type": "A_待突破",
+                    "setup_type": "A0_首日整理",
+                    **build_signal_metrics(df.iloc[-1]["date"], df.iloc[-1]["close"], df.iloc[a0_ignite_idx]["close"]),
+                    **inside_equal_note,
+                    **a0_ignite_metrics,
+                    **a0_pb_metrics,
+                    **factor_flags
+                }
+            else:
+                candidate_debugs.append({
+                    "reason": "a0_pullback_fail",
+                    "reason_list": "|".join(a0_pb_reasons),
+                    **get_default_inside_equal_highs_fields(),
+                    **a0_ignite_metrics,
+                    **a0_pb_metrics,
+                    **factor_flags
+                })
+
+    # -------------------------------------------------
+    # 3) 判 A1~A3：启动棒 + 1~3根整理（整理区不含今天）
+    # -------------------------------------------------
+    for pullback_bars in range(PULLBACK_BARS_MIN, PULLBACK_BARS_MAX + 1):
+        factor_flags = get_default_factor_flags()
+        factor_flags.update(last_flags)
+
+        # 关键修正：
+        # 今天是目标日，不属于整理区
+        # 因此 ignite_idx 需要再往前多退一天
+        ignite_idx = last_idx - pullback_bars - 1
+
+        days_from_last = last_idx - ignite_idx
+        window_match_ok = ignite_idx >= 30 and (IGNITE_LOOKBACK_MIN <= days_from_last <= IGNITE_LOOKBACK_MAX)
+        factor_flags["ignite_window_match_ok"] = bool(window_match_ok)
+
+        if not window_match_ok:
+            candidate_debugs.append({
+                "reason": "ignite_position_out_of_lookback_window",
+                "reason_list": "ignite_position_out_of_lookback_window",
+                "pullback_bars": pullback_bars,
+                **get_default_inside_equal_highs_fields(),
+                **factor_flags
+            })
+            continue
+
+        ignite_ok, ignite_reasons, ignite_metrics, ignite_flags = check_ignite_bar(df, ignite_idx)
+        factor_flags.update(ignite_flags)
+
+        if not ignite_ok:
+            candidate_debugs.append({
+                "reason": "ignite_fail",
+                "reason_list": "|".join(ignite_reasons),
+                "pullback_bars": pullback_bars,
+                **get_default_inside_equal_highs_fields(),
+                **ignite_metrics,
+                **factor_flags
+            })
+            continue
+
+        pb_ok, pb_reasons, pb_metrics, pb_flags = check_pullback_before_today(df, ignite_idx, last_idx)
+        factor_flags.update(pb_flags)
+
+        if not pb_ok:
+            candidate_debugs.append({
+                "reason": "pullback_fail",
+                "reason_list": "|".join(pb_reasons),
+                **get_default_inside_equal_highs_fields(),
+                **ignite_metrics,
+                **pb_metrics,
+                **factor_flags
+            })
+            continue
+
+        pullback_high_close, _ = get_pullback_high_close_before_today(df, ignite_idx, last_idx)
+        if pullback_high_close is None:
+            candidate_debugs.append({
+                "reason": "signal_state_fail",
+                "reason_list": "no_pullback_before_today",
+                **get_default_inside_equal_highs_fields(),
+                **ignite_metrics,
+                **pb_metrics,
+                **factor_flags
+            })
+            continue
+
+        signal_ok, signal_type, signal_reasons, signal_metrics, signal_flags = classify_signal_a_only(
+            df, pullback_high_close
+        )
+        factor_flags.update(signal_flags)
+
+        if not signal_ok:
+            candidate_debugs.append({
+                "reason": "signal_state_fail",
+                "reason_list": "|".join(signal_reasons),
+                **get_default_inside_equal_highs_fields(),
+                **ignite_metrics,
+                **pb_metrics,
+                **signal_metrics,
+                **factor_flags
+            })
+            continue
+
+        inside_equal_note = evaluate_inside_equal_highs_pullback(df, ignite_idx, last_idx)
+
+        return {
+            "matched": True,
+            "signal_type": signal_type,
+            "setup_type": f"A{pullback_bars}_待突破",
+            **inside_equal_note,
+            **ignite_metrics,
+            **pb_metrics,
+            **signal_metrics,
+            **factor_flags
+        }
+
+    if candidate_debugs:
+        best = candidate_debugs[0]
+        return {
+            "matched": False,
+            "reason": best.get("reason", "not_matched"),
+            "reason_list": best.get("reason_list", best.get("reason", "not_matched")),
+            **best
+        }
+
+    return {
+        "matched": False,
+        "reason": "no_valid_3barplay_ac",
+        "reason_list": "no_valid_3barplay_ac",
+        **get_default_factor_flags(),
+        **get_default_inside_equal_highs_fields(),
+    }
+
+
+# =========================
+# 单股多日期评估
+# =========================
+def evaluate_one_stock_multi_dates(pro, ts_code: str, ticker: str, name: str, target_dates, start_date, end_date):
+    matched_list = []
+    debug_list = []
+    failed_list = []
+
+    try:
+        raw = fetch_tushare_daily_with_retry(pro, ts_code, start_date, end_date, max_retry=3)
+    except Exception as e:
+        failed_list.append({
+            "ticker": ticker,
+            "ts_code": ts_code,
+            "name": name,
+            "target_date": "",
+            "error": f"daily_fetch_exception: {type(e).__name__}: {e}"
+        })
+        return matched_list, debug_list, failed_list
+
+    try:
+        df_full = standardize_tushare_daily(raw)
+    except Exception as e:
+        failed_list.append({
+            "ticker": ticker,
+            "ts_code": ts_code,
+            "name": name,
+            "target_date": "",
+            "error": f"standardize_exception: {type(e).__name__}: {e}"
+        })
+        return matched_list, debug_list, failed_list
+
+    if df_full.empty:
+        failed_list.append({
+            "ticker": ticker,
+            "ts_code": ts_code,
+            "name": name,
+            "target_date": "",
+            "error": "no_data"
+        })
+        return matched_list, debug_list, failed_list
+
+    for target_date in target_dates:
+        try:
+            df = slice_df_to_target_date(df_full, target_date)
+
+            if df.empty:
+                debug_list.append({
+                    "ticker": ticker,
+                    "ts_code": ts_code,
+                    "name": name,
+                    "target_date": target_date,
+                    "error": "no_data_before_target_date",
+                    "reason_list": "no_data_before_target_date",
+                    **get_default_factor_flags(),
+                    **get_default_inside_equal_highs_fields(),
+                })
+                continue
+
+            if len(df) < 120:
+                debug_list.append({
+                    "ticker": ticker,
+                    "ts_code": ts_code,
+                    "name": name,
+                    "target_date": target_date,
+                    "error": "not_enough_bars",
+                    "reason_list": "not_enough_bars",
+                    **get_default_factor_flags(),
+                    **get_default_inside_equal_highs_fields(),
+                })
+                continue
+
+            chk = check_3barplay_ac(df)
+
+            if chk.get("matched", False):
+                matched_list.append({
+                    "ticker": ticker,
+                    "ts_code": ts_code,
+                    "name": name,
+                    "target_date": target_date,
+                    **chk
+                })
+            else:
+                debug_list.append({
+                    "ticker": ticker,
+                    "ts_code": ts_code,
+                    "name": name,
+                    "target_date": target_date,
+                    "error": chk.get("reason", "not_matched"),
+                    "reason_list": chk.get("reason_list", ""),
+                    **{k: v for k, v in chk.items() if k not in ["matched", "reason", "reason_list"]}
+                })
+
+            time.sleep(SLEEP_SEC)
+
+        except Exception as e:
+            failed_list.append({
+                "ticker": ticker,
+                "ts_code": ts_code,
+                "name": name,
+                "target_date": target_date,
+                "error": f"check_exception: {type(e).__name__}: {e}"
+            })
+
+    return matched_list, debug_list, failed_list
+
+
+# =========================
+# 输出文件
+# =========================
+def make_output_paths(end_date: str):
+    return {
+        "output": os.path.join(OUTPUT_DIR, f"three_bar_play_ac_candidates_{end_date}.csv"),
+        "debug": os.path.join(OUTPUT_DIR, f"three_bar_play_ac_debug_rejected_{end_date}.csv"),
+        "failed": os.path.join(OUTPUT_DIR, f"three_bar_play_ac_failed_fetch_{end_date}.csv"),
+        "filtered": os.path.join(OUTPUT_DIR, f"three_bar_play_ac_filtered_out_{end_date}.csv"),
+    }
+
+
+# =========================
+# 主程序
+# =========================
+def main():
+    if not TUSHARE_TOKEN:
+        raise ValueError("未检测到环境变量 TUSHARE_TOKEN，请在 GitHub Secrets 中配置。")
+
+    target_dates = get_target_dates()
+    end_date = max(target_dates)
+    output_paths = make_output_paths(end_date)
+
+    ts.set_token(TUSHARE_TOKEN)
+    pro = ts.pro_api()
+
+    start_time = time.perf_counter()
+
+    print("1) 读取本地全市场股票列表，并剔除 ST / 80亿以下 ...")
+    universe, filtered_out = load_universe_from_csv()
+
+    print("原始待扫描股票数:", len(universe))
+    print("过滤掉数量(ST/80亿以下):", len(filtered_out))
+    print("TARGET_DATES:", target_dates)
+    print("END_DATE:", end_date)
+    print("START_DATE:", START_DATE)
+
+    print("\n2) 开始 3 Bar Play 多日期扫描（Tushare，A+C版）...")
+
+    matched = []
+    debug_rejected = []
+    failed_fetch = []
+    error_counter = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(
+                evaluate_one_stock_multi_dates,
+                pro,
+                row["ts_code"],
+                row["ticker"],
+                row["name"],
+                target_dates,
+                START_DATE,
+                end_date,
+            ): row["ts_code"]
+            for _, row in universe.iterrows()
+        }
+
+        total = len(future_map)
+
+        for i, future in enumerate(as_completed(future_map), 1):
+            matched_list, debug_list, failed_list = future.result()
+
+            matched.extend(matched_list)
+            debug_rejected.extend(debug_list)
+            failed_fetch.extend(failed_list)
+
+            for item in debug_list:
+                err = item.get("error", "unknown")
+                error_counter[err] = error_counter.get(err, 0) + 1
+
+            for item in failed_list:
+                err = item.get("error", "unknown")
+                error_counter[err] = error_counter.get(err, 0) + 1
+
+            if i % 100 == 0 or i == total:
+                elapsed_now = time.perf_counter() - start_time
+                avg_per_stock = elapsed_now / i
+                est_total = avg_per_stock * total
+                remain = est_total - elapsed_now
+
+                rh = int(remain // 3600)
+                rm = int((remain % 3600) // 60)
+                rs = remain % 60
+
+                print(
+                    f"进度: {i}/{total} | 命中: {len(matched)} | 调试未过: {len(debug_rejected)} | 抓取失败: {len(failed_fetch)} "
+                    f"| 预计剩余: {rh}小时 {rm}分钟 {rs:.1f}秒"
+                )
+
+    matched_df = pd.DataFrame(matched)
+    debug_df = pd.DataFrame(debug_rejected)
+    failed_df = pd.DataFrame(failed_fetch)
+    filtered_df = filtered_out.copy()
+
+    if not matched_df.empty:
+        sort_cols = [c for c in [
+            "target_date", "signal_type", "setup_type",
+            "dist_to_pullback_high_close_pct", "pullback_bars",
+            "ignite_vol_vs_ma5"
+        ] if c in matched_df.columns]
+
+        ascending_flags = []
+        for c in sort_cols:
+            if c in ["target_date", "signal_type", "setup_type"]:
+                ascending_flags.append(True)
+            elif c == "pullback_bars":
+                ascending_flags.append(True)
+            else:
+                ascending_flags.append(False)
+
+        matched_df = matched_df.sort_values(
+            by=sort_cols,
+            ascending=ascending_flags
+        ).reset_index(drop=True)
+
+    matched_df.to_csv(output_paths["output"], index=False, encoding="utf-8-sig")
+    debug_df.to_csv(output_paths["debug"], index=False, encoding="utf-8-sig")
+    failed_df.to_csv(output_paths["failed"], index=False, encoding="utf-8-sig")
+    filtered_df.to_csv(output_paths["filtered"], index=False, encoding="utf-8-sig")
+
+    print("\n候选结果已保存:", output_paths["output"])
+    print("调试未通过已保存:", output_paths["debug"])
+    print("抓取失败已保存:", output_paths["failed"])
+    print("已过滤股票已保存:", output_paths["filtered"])
+
+    print("\n扫描完成")
+    print("候选数量:", len(matched_df))
+    print("调试未通过数量:", len(debug_df))
+    print("抓取失败数量:", len(failed_df))
+    print("过滤掉数量(ST/80亿以下):", len(filtered_df))
+
+    if not matched_df.empty and "signal_type" in matched_df.columns:
+        print("\nA/C 类数量统计：")
+        print(matched_df["signal_type"].value_counts())
+
+    if not matched_df.empty and "setup_type" in matched_df.columns:
+        print("\n形态子类型统计：")
+        print(matched_df["setup_type"].value_counts())
+
+    if not matched_df.empty and "target_date" in matched_df.columns:
+        print("\n按日期统计候选数量：")
+        print(matched_df.groupby("target_date").size())
+
+    print("\n失败原因统计：")
+    for k, v in sorted(error_counter.items(), key=lambda x: -x[1]):
+        print(k, v)
+
+    if not matched_df.empty:
+        print("\n候选前20条：")
+        cols = [
+            "ticker", "name", "ts_code", "target_date", "signal_type", "setup_type", "signal_date",
+            "inside_equal_highs_priority_ok", "inside_equal_highs_note",
+            "ignite_date", "pullback_bars", "ignite_pct_chg", "ignite_vol_vs_ma5", "ignite_vol_vs_ma20",
+            "pullback_high_close", "close_now", "dist_to_pullback_high_close_pct"
+        ]
+        cols = [c for c in cols if c in matched_df.columns]
+        print(matched_df[cols].head(20).to_string(index=False))
+
+    if not debug_df.empty:
+        print("\n调试未通过前20条：")
+        cols = [
+            "ticker", "name", "ts_code", "target_date", "error", "reason_list", "close_now",
+            "setup_type",
+            "inside_equal_highs_priority_ok", "inside_equal_highs_note",
+            "last_day_close_above_ma20_ok", "last_day_ma20_not_down_ok",
+            "ignite_window_match_ok", "ignite_pct_ge_4pct_ok", "ignite_body_ratio_ge_0p6_ok",
+            "ignite_close_near_high_ok", "ignite_volume_above_ma5_ok", "ignite_volume_above_ma20_ok",
+            "ignite_near_prev30_high_ok",
+            "pullback_bars_1_to_3_ok", "pullback_low_above_body_mid_ok",
+            "pullback_bar_range_small_ok", "pullback_avg_volume_lower_ok",
+            "pullback_no_big_bear_ok", "pullback_close_above_body_mid_ok",
+            "a0_yesterday_ignite_ok", "a0_today_pullback_ok",
+            "signal_is_a_class_ok", "signal_is_c_class_ok"
+        ]
+        cols = [c for c in cols if c in debug_df.columns]
+        print(debug_df[cols].head(20).to_string(index=False))
+
+    if not failed_df.empty:
+        print("\n抓取失败前20条：")
+        cols = ["ticker", "name", "ts_code", "target_date", "error"]
+        cols = [c for c in cols if c in failed_df.columns]
+        print(failed_df[cols].head(20).to_string(index=False))
+
+    end_time = time.perf_counter()
+    elapsed = end_time - start_time
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = elapsed % 60
+
+    print(f"\n总耗时: {hours}小时 {minutes}分钟 {seconds:.2f}秒")
+    if len(universe) > 0:
+        print(f"平均每只股票耗时: {elapsed / len(universe):.2f} 秒")
+
+
+if __name__ == "__main__":
+    main()
